@@ -4,10 +4,9 @@ import re
 import urllib.request
 from typing import Literal
 
-import axengine as axe
-
 from frigate.const import MODEL_CACHE_DIR
 from frigate.detectors.detection_api import DetectionApi
+from frigate.detectors.detection_runners import AxEngineModelRunner
 from frigate.detectors.detector_config import BaseDetectorConfig, ModelTypeEnum
 from frigate.util.model import post_process_yolo
 
@@ -30,13 +29,13 @@ class Axengine(DetectionApi):
     type_key = DETECTOR_KEY
 
     def __init__(self, config: AxengineDetectorConfig):
-        logger.info("__init__ axengine")
+        logger.info("Initializing axengine detector")
         super().__init__(config)
         self.height = config.model.height
         self.width = config.model.width
         model_path = config.model.path or "frigate-yolov9-tiny"
         model_props = self.parse_model_input(model_path)
-        self.session = axe.InferenceSession(model_props["path"])
+        self.runner = AxEngineModelRunner(model_props["path"])
 
     def __del__(self):
         pass
@@ -76,10 +75,9 @@ class Axengine(DetectionApi):
         )
 
     def detect_raw(self, tensor_input):
-        results = None
-        results = self.session.run(None, {"images": tensor_input})
+        output = self.runner.run({"images": tensor_input})
         if self.detector_config.model.model_type == ModelTypeEnum.yologeneric:
-            return post_process_yolo(results, self.width, self.height)
+            return post_process_yolo(output, self.width, self.height)
         else:
             raise ValueError(
                 f'Model type "{self.detector_config.model.model_type}" is currently not supported.'

@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import onnxruntime as ort
 
+from frigate.util.ax_converter import auto_resolve_ax_model, get_ax_model_config, is_ax_compatible
 from frigate.util.model import get_ort_providers
 from frigate.util.rknn_converter import auto_convert_model, is_rknn_compatible
 
@@ -548,11 +549,146 @@ class RKNNModelRunner(BaseModelRunner):
                 pass
 
 
+class AxEngineModelRunner(BaseModelRunner):
+    """Run models using Axera axengine library.
+
+    Supports both single-model inference (e.g., object detection) and
+    dual-encoder inference (e.g., CLIP with separate text/image encoders).
+    For dual-encoder models, inputs are routed to the appropriate encoder
+    based on the input keys, and outputs are returned in ONNX-compatible format.
+    """
+
+    def __init__(self, model_path: str, model_type: str | None = None):
+        self.model_path = model_path
+        self.model_type = model_type
+        self._sessions: dict = {}
+        self._ax_config: dict | None = None
+        self._load_model()
+
+    def _load_model(self):
+        """Load axengine model(s)."""
+        try:
+            import axengine as axe  # type: ignore
+        except ImportError:
+            raise ImportError("axengine is not available")
+
+        self._ax_config = get_ax_model_config(self.model_type)
+
+        if self._ax_config and "files" in self._ax_config:
+            # Dual-encoder mode (CLIP-like): load multiple models from same directory
+            model_dir = os.path.dirname(self.model_path)
+            for key, filename in self._ax_config["files"].items():
+                path = os.path.join(model_dir, filename)
+                self._sessions[key] = axe.InferenceSession(path)
+                logger.info("Loaded axengine model: %s", path)
+        else:
+            # Single model mode (detector)
+            self._sessions["default"] = axe.InferenceSession(self.model_path)
+            logger.info("Loaded axengine model: %s", self.model_path)
+
+    def get_input_names(self) -> list[str]:
+        """Get input names for the model."""
+        if self._ax_config and "files" in self._ax_config:
+            return ["input_ids", "pixel_values"]
+        return ["images"]
+
+    def get_input_width(self) -> int:
+        """Get the input width of the model."""
+        if self._ax_config:
+            return 512  # CLIP v2 uses 512x512
+        return -1
+
+    def _normalize_images(self, pixel_values: np.ndarray) -> np.ndarray:
+        """Apply mean/std normalization for AX image encoder.
+
+        The ONNX model normalizes internally, but the AX compiled model
+        expects pre-normalized input.
+        """
+        mean = np.array(
+            self._ax_config["image_mean"], dtype=np.float32
+        ).reshape(1, 3, 1, 1)
+        std = np.array(
+            self._ax_config["image_std"], dtype=np.float32
+        ).reshape(1, 3, 1, 1)
+        return (pixel_values - mean) / std
+
+    def _prepare_text_input(self, input_ids: np.ndarray) -> np.ndarray:
+        """Pad and cast text input for AX text encoder.
+
+        AX compiled models require fixed-length input, so we pad/truncate
+        to the configured max_length and cast to int32.
+        """
+        max_len = self._ax_config.get("text_max_length", 50)
+        batch_size = input_ids.shape[0]
+        current_len = input_ids.shape[1]
+
+        if current_len < max_len:
+            padding = np.zeros(
+                (batch_size, max_len - current_len), dtype=input_ids.dtype
+            )
+            input_ids = np.concatenate([input_ids, padding], axis=1)
+        elif current_len > max_len:
+            input_ids = input_ids[:, :max_len]
+
+        return input_ids.astype(np.int32)
+
+    def run(self, inputs: dict[str, Any]) -> Any:
+        """Run inference with axengine model(s).
+
+        For dual-encoder models (CLIP), routes input to the appropriate
+        encoder and returns results in ONNX-compatible format:
+        [None, None, text_embeddings, image_embeddings]
+        """
+        if not self._ax_config or "files" not in self._ax_config:
+            # Single model mode
+            return self._sessions["default"].run(None, inputs)
+
+        # Dual-encoder mode: route to the appropriate encoder
+        results = [None, None, None, None]
+        text_input_name = self._ax_config.get("text_input_name", "inputs_id")
+
+        # Run text encoder if input_ids has real data (not all zeros)
+        if "input_ids" in inputs and np.any(inputs["input_ids"]):
+            input_ids = self._prepare_text_input(inputs["input_ids"])
+            text_embs = []
+            for ids in input_ids:
+                ids = ids.reshape(1, -1)
+                out = self._sessions["text_encoder"].run(
+                    None, {text_input_name: ids}
+                )
+                text_embs.append(out[0][0])
+            results[2] = np.array(text_embs)
+
+        # Run image encoder if pixel_values has real data (not all zeros)
+        if "pixel_values" in inputs and np.any(inputs["pixel_values"]):
+            pixel_values = self._normalize_images(inputs["pixel_values"])
+            img_embs = []
+            for pv in pixel_values:
+                if len(pv.shape) == 3:
+                    pv = pv[None, ...]
+                out = self._sessions["image_encoder"].run(
+                    None, {"pixel_values": pv}
+                )
+                img_embs.append(out[0][0])
+            results[3] = np.array(img_embs)
+
+        return results
+
+    def __del__(self):
+        """Cleanup when the runner is destroyed."""
+        self._sessions.clear()
+
+
 def get_optimized_runner(
     model_path: str, device: str | None, model_type: str, **kwargs
 ) -> BaseModelRunner:
     """Get an optimized runner for the hardware."""
     device = device or "AUTO"
+
+    if device != "CPU" and is_ax_compatible(model_type):
+        ax_path = auto_resolve_ax_model(model_type)
+        if ax_path:
+            return AxEngineModelRunner(ax_path, model_type)
 
     if device != "CPU" and is_rknn_compatible(model_path):
         rknn_path = auto_convert_model(model_path)

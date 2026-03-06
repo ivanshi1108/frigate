@@ -292,46 +292,32 @@ export default function Explore() {
 
   const modelVersion = config?.semantic_search.model || "jinav1";
   const modelSize = config?.semantic_search.model_size || "small";
-  const isAxJinaV2 = useMemo(
-    () =>
-      modelVersion === "jinav2" &&
-      Object.values(
-        (config?.detectors ?? {}) as Record<string, { type?: string }>,
-      ).some((detector) => detector?.type === "axengine"),
-    [modelVersion, config?.detectors],
-  );
 
   // Text model state
   const { payload: textModelState } = useModelState(
-    isAxJinaV2
-      ? "AXERA-TECH/jina-clip-v2-text_encoder.axmodel"
-      : modelVersion === "jinav1"
-        ? "jinaai/jina-clip-v1-text_model_fp16.onnx"
-        : modelSize === "large"
-          ? "jinaai/jina-clip-v2-model_fp16.onnx"
-          : "jinaai/jina-clip-v2-model_quantized.onnx",
+    modelVersion === "jinav1"
+      ? "jinaai/jina-clip-v1-text_model_fp16.onnx"
+      : modelSize === "large"
+        ? "jinaai/jina-clip-v2-model_fp16.onnx"
+        : "jinaai/jina-clip-v2-model_quantized.onnx",
   );
 
   // Tokenizer state
   const { payload: textTokenizerState } = useModelState(
-    isAxJinaV2
-      ? "AXERA-TECH/jina-clip-v2-tokenizer"
-      : modelVersion === "jinav1"
-        ? "jinaai/jina-clip-v1-tokenizer"
-        : "jinaai/jina-clip-v2-tokenizer",
+    modelVersion === "jinav1"
+      ? "jinaai/jina-clip-v1-tokenizer"
+      : "jinaai/jina-clip-v2-tokenizer",
   );
 
   // Vision model state (same as text model for jinav2)
   const visionModelFile =
-    isAxJinaV2
-      ? "AXERA-TECH/jina-clip-v2-image_encoder.axmodel"
-      : modelVersion === "jinav1"
-        ? modelSize === "large"
-          ? "jinaai/jina-clip-v1-vision_model_fp16.onnx"
-          : "jinaai/jina-clip-v1-vision_model_quantized.onnx"
-        : modelSize === "large"
-          ? "jinaai/jina-clip-v2-model_fp16.onnx"
-          : "jinaai/jina-clip-v2-model_quantized.onnx";
+    modelVersion === "jinav1"
+      ? modelSize === "large"
+        ? "jinaai/jina-clip-v1-vision_model_fp16.onnx"
+        : "jinaai/jina-clip-v1-vision_model_quantized.onnx"
+      : modelSize === "large"
+        ? "jinaai/jina-clip-v2-model_fp16.onnx"
+        : "jinaai/jina-clip-v2-model_quantized.onnx";
   const { payload: visionModelState } = useModelState(visionModelFile);
 
   // Preprocessor/feature extractor state
@@ -346,10 +332,9 @@ export default function Explore() {
       textModelState === "downloaded" &&
       textTokenizerState === "downloaded" &&
       visionModelState === "downloaded" &&
-      (isAxJinaV2 || visionFeatureExtractorState === "downloaded")
+      visionFeatureExtractorState === "downloaded"
     );
   }, [
-    isAxJinaV2,
     textModelState,
     textTokenizerState,
     visionModelState,
@@ -376,7 +361,7 @@ export default function Explore() {
         !textModelState ||
         !textTokenizerState ||
         !visionModelState ||
-        (!isAxJinaV2 && !visionFeatureExtractorState)))
+        !visionFeatureExtractorState))
   ) {
     return (
       <ActivityIndicator className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2" />
@@ -466,14 +451,12 @@ export default function Explore() {
                       "exploreIsUnavailable.downloadingModels.setup.visionModel",
                     )}
                   </div>
-                  {!isAxJinaV2 && (
-                    <div className="flex flex-row items-center justify-center gap-2">
-                      {renderModelStateIcon(visionFeatureExtractorState)}
-                      {t(
-                        "exploreIsUnavailable.downloadingModels.setup.visionModelFeatureExtractor",
-                      )}
-                    </div>
-                  )}
+                  <div className="flex flex-row items-center justify-center gap-2">
+                    {renderModelStateIcon(visionFeatureExtractorState)}
+                    {t(
+                      "exploreIsUnavailable.downloadingModels.setup.visionModelFeatureExtractor",
+                    )}
+                  </div>
                   <div className="flex flex-row items-center justify-center gap-2">
                     {renderModelStateIcon(textModelState)}
                     {t(
@@ -490,7 +473,7 @@ export default function Explore() {
                 {(textModelState === "error" ||
                   textTokenizerState === "error" ||
                   visionModelState === "error" ||
-                  (!isAxJinaV2 && visionFeatureExtractorState === "error")) && (
+                  visionFeatureExtractorState === "error") && (
                   <div className="my-3 max-w-96 text-center text-danger">
                     {t("exploreIsUnavailable.downloadingModels.error")}
                   </div>
