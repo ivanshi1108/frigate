@@ -10,6 +10,10 @@ from typing import Any
 import numpy as np
 import onnxruntime as ort
 
+from frigate.util.axengine_converter import (
+    auto_convert_model as auto_load_axengine_model,
+)
+from frigate.util.axengine_converter import is_axengine_compatible
 from frigate.util.model import get_ort_providers
 from frigate.util.rknn_converter import auto_convert_model, is_rknn_compatible
 
@@ -548,11 +552,134 @@ class RKNNModelRunner(BaseModelRunner):
                 pass
 
 
+class AXEngineModelRunner(BaseModelRunner):
+    """Run AXEngine models for embeddings."""
+
+    _mean = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32).reshape(
+        1, 3, 1, 1
+    )
+    _std = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32).reshape(
+        1, 3, 1, 1
+    )
+
+    def __init__(self, model_path: str, model_type: str | None = None):
+        self.model_path = model_path
+        self.model_type = model_type
+        self._inference_lock = threading.Lock()
+        self.image_session = None
+        self.text_session = None
+        self.text_pad_token_id = 0
+        self._load_model()
+
+    def _load_model(self):
+        try:
+            import axengine as axe
+            from transformers import AutoTokenizer
+        except ImportError:
+            logger.error("AXEngine is not available")
+            raise ImportError("AXEngine is not available")
+
+        model_dir = os.path.dirname(self.model_path)
+        image_model_path = os.path.join(model_dir, "image_encoder.axmodel")
+        text_model_path = os.path.join(model_dir, "text_encoder.axmodel")
+        tokenizer_path = os.path.join(model_dir, "tokenizer")
+
+        self.image_session = axe.InferenceSession(image_model_path)
+        self.text_session = axe.InferenceSession(text_model_path)
+
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_path,
+                trust_remote_code=True,
+                clean_up_tokenization_spaces=True,
+            )
+            if tokenizer.pad_token_id is not None:
+                self.text_pad_token_id = int(tokenizer.pad_token_id)
+        except Exception:
+            logger.warning(
+                "Failed to load tokenizer from %s for AXEngine padding, using 0",
+                tokenizer_path,
+            )
+
+    def get_input_names(self) -> list[str]:
+        return ["input_ids", "pixel_values"]
+
+    def get_input_width(self) -> int:
+        return 512
+
+    @staticmethod
+    def _has_real_text_inputs(inputs: dict[str, Any]) -> bool:
+        input_ids = inputs.get("input_ids")
+
+        if input_ids is None:
+            return False
+
+        if input_ids.ndim < 2:
+            return False
+
+        return input_ids.shape[-1] != 16 or np.any(input_ids)
+
+    @staticmethod
+    def _has_real_image_inputs(inputs: dict[str, Any]) -> bool:
+        pixel_values = inputs.get("pixel_values")
+
+        return pixel_values is not None and np.any(pixel_values)
+
+    def _prepare_text_inputs(self, input_ids: np.ndarray) -> np.ndarray:
+        padded_input_ids = np.full((1, 50), self.text_pad_token_id, dtype=np.int32)
+        truncated_input_ids = input_ids.reshape(1, -1)[:, :50].astype(np.int32)
+        padded_input_ids[:, : truncated_input_ids.shape[1]] = truncated_input_ids
+        return padded_input_ids
+
+    @classmethod
+    def _prepare_pixel_values(cls, pixel_values: np.ndarray) -> np.ndarray:
+        if len(pixel_values.shape) == 3:
+            pixel_values = pixel_values[None, ...]
+
+        pixel_values = pixel_values.astype(np.float32)
+        return (pixel_values - cls._mean) / cls._std
+
+    def run(self, inputs: dict[str, Any]) -> list[np.ndarray | None]:
+        outputs: list[np.ndarray | None] = [None, None, None, None]
+
+        with self._inference_lock:
+            if self._has_real_text_inputs(inputs):
+                text_embeddings = []
+                for input_ids in inputs["input_ids"]:
+                    text_embeddings.append(
+                        self.text_session.run(
+                            None,
+                            {"inputs_id": self._prepare_text_inputs(input_ids)},
+                        )[0][0]
+                    )
+                outputs[2] = np.array(text_embeddings)
+
+            if self._has_real_image_inputs(inputs):
+                image_embeddings = []
+                for pixel_values in inputs["pixel_values"]:
+                    image_embeddings.append(
+                        self.image_session.run(
+                            None,
+                            {"pixel_values": self._prepare_pixel_values(pixel_values)},
+                        )[0][0]
+                    )
+
+                outputs[3] = np.array(image_embeddings)
+
+        return outputs
+
+
 def get_optimized_runner(
     model_path: str, device: str | None, model_type: str, **kwargs
 ) -> BaseModelRunner:
     """Get an optimized runner for the hardware."""
     device = device or "AUTO"
+
+    if is_axengine_compatible(model_path, device, model_type):
+        axmodel_path = auto_load_axengine_model(model_path, model_type)
+
+        if axmodel_path:
+            return AXEngineModelRunner(axmodel_path, model_type)
 
     if device != "CPU" and is_rknn_compatible(model_path):
         rknn_path = auto_convert_model(model_path)

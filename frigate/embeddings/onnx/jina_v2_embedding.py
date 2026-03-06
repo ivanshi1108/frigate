@@ -37,13 +37,18 @@ class JinaV2Embedding(BaseEmbedding):
             "model_fp16.onnx" if model_size == "large" else "model_quantized.onnx"
         )
         HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
+        use_axengine = (device or "").upper() == "AXENGINE"
         super().__init__(
             model_name="jinaai/jina-clip-v2",
             model_file=model_file,
-            download_urls={
-                model_file: f"{HF_ENDPOINT}/jinaai/jina-clip-v2/resolve/main/onnx/{model_file}",
-                "preprocessor_config.json": f"{HF_ENDPOINT}/jinaai/jina-clip-v2/resolve/main/preprocessor_config.json",
-            },
+            download_urls=(
+                {}
+                if use_axengine
+                else {
+                    model_file: f"{HF_ENDPOINT}/jinaai/jina-clip-v2/resolve/main/onnx/{model_file}",
+                    "preprocessor_config.json": f"{HF_ENDPOINT}/jinaai/jina-clip-v2/resolve/main/preprocessor_config.json",
+                }
+            ),
         )
         self.tokenizer_file = "tokenizer"
         self.embedding_type = embedding_type
@@ -59,7 +64,11 @@ class JinaV2Embedding(BaseEmbedding):
         self._call_lock = threading.Lock()
 
         # download the model and tokenizer
-        files_names = list(self.download_urls.keys()) + [self.tokenizer_file]
+        files_names = (
+            [self.tokenizer_file]
+            if use_axengine
+            else list(self.download_urls.keys()) + [self.tokenizer_file]
+        )
         if not all(
             os.path.exists(os.path.join(self.download_path, n)) for n in files_names
         ):
